@@ -1,74 +1,1163 @@
-# ESP32 Firmware
+# ESP32 Cold Chain Firmware
 
-## Purpose
+## 1. Project Overview
 
-The ESP32 is the edge node for one refrigerator. It samples the environmental sensors, reads the door switch and shelf RFID zones, then sends timestamped telemetry to the backend.
+This firmware uses an ESP32 with three sensor modules:
 
-## Hardware
+- MFRC522 RFID reader
+- DHT11 temperature and humidity sensor
+- BMP180 temperature and pressure sensor
 
-| Component | Quantity | Role |
-| --- | ---: | --- |
-| ESP32 DevKit | 1 | Sensor controller and network client |
-| DHT22 | 1 | Primary temperature and humidity |
-| BMP280 or BMP180 | 1 | Pressure and secondary temperature |
-| MFRC522 13.56 MHz reader | 2 | One reader per shelf/zone |
-| RFID tag | 2 | One tracked product tag per zone |
-| Reed switch and magnet | 1 | Refrigerator door state |
-| Regulated 5 V supply | 1 | System power; 5 V/2 A minimum starting point, 5 V/3 A recommended for margin |
+The ESP32 uses FreeRTOS to separate the work between its two CPU cores.
 
-Breadboard, USB cable, jumper wires, and the physical chamber materials are needed for the prototype. Pin assignments are not specified yet and should be documented after the wiring is finalized.
-
-## RFID Zones
-
-Reader 1 represents shelf 1 and reader 2 represents shelf 2. Each product's tag is associated with its shelf reader. A product is considered removed when its tag is no longer detected by that reader; firmware should poll consistently and avoid treating a brief missed read as a confirmed inventory change.
-
-For readers mounted back-to-back, orient antenna faces toward their respective zones and use a physical separator/gap. Validate reader spacing and cross-reading behavior on the assembled refrigerator because RF coupling depends on the final placement.
-
-## Sampling and Telemetry
-
-The target reading cycle samples DHT22 temperature/humidity, BMP temperature/pressure, door state, and active RFID tags. The system specification targets telemetry every 5-30 seconds; the production interval should be selected and kept consistent with backend and ML window settings.
-
-Example device envelope:
-
-```json
-{
-  "device_id": "VAULT_FRIDGE_01",
-  "timestamp": "2026-10-04T14:29:00Z",
-  "connection_type": "MQTT",
-  "battery_level": 98,
-  "telemetry": {
-    "temperature_dht": 5.2,
-    "humidity": 48.5,
-    "temperature_bmp": 5.4,
-    "pressure": 1012.3,
-    "door": "closed"
-  },
-  "rfid": [
-    {"reader_id": 1, "tag_uid": "A1B2C3D4", "product": "Vaccine_A"},
-    {"reader_id": 2, "tag_uid": "E5F6G7H8", "product": "Vaccine_B"}
-  ]
-}
+```text
+ESP32
+│
+├── Core 0
+│   └── Sensor Task
+│       ├── RFID
+│       ├── DHT11
+│       └── BMP180
+│
+└── Core 1
+    └── Network Task
+        └── Reads SensorData
+            └── Prints data to Serial
 ```
 
-## Communication and Recovery
+The current firmware does **not** implement MQTT, HTTP, Wi-Fi, or backend communication.
 
-1. Publish telemetry through MQTT over TLS as the primary transport (typically TCP port 8883).
-2. If publish/acknowledgement fails, POST the telemetry to `https://<backend-host>/api/v1/telemetry/backup` over TLS (TCP port 443), set `connection_type` to `HTTPS`, and treat HTTP `200` or `201` as success.
-3. If both transports fail, append the reading to non-volatile LittleFS or SPIFFS storage and retry when connectivity returns. Preserve timestamps and avoid dropping buffered records until delivery is acknowledged.
+---
 
-BLE is reserved in the system design for local diagnostics and field service; its behavior and security are not defined yet.
+# 2. FreeRTOS Architecture
 
-## Power and Electrical Safety
+## Core 0 — Sensor Task
 
-- Use a regulated 5 V supply with a common ground for the prototype.
-- Never apply 5 V directly to ESP32 GPIO pins; ESP32 logic is 3.3 V.
-- Check each sensor/reader board's supply and logic-level requirements before wiring it to the ESP32.
-- Validate MFRC522 antenna separation and sensor readings in the final enclosure.
+Core 0 is responsible for reading all sensors.
 
-## Software Target
+The main task is:
 
-The proposed firmware stack is Arduino C/C++ or PlatformIO with MFRC522, DHT, BMP, PubSubClient, HTTPClient, and ArduinoJson libraries. TLS certificate validation and API-key handling must be configured for deployment; do not embed production secrets in source control.
+```cpp
+sensorTask()
+```
 
-## Current Repository Status
+It runs on:
 
-The `cold_chain_esp32.ino` sketch is currently empty. Hardware, payload, and failover behavior in this README describe the target design and are not implemented firmware yet.
+```text
+Core 0
+```
+
+The sensor task calls:
+
+```cpp
+readSensors()
+```
+
+which handles:
+
+```cpp
+readRFID()
+readDHT()
+readBMP()
+```
+
+The sensor task updates the shared:
+
+```cpp
+SensorData
+```
+
+structure.
+
+### Core 0 responsibilities
+
+```text
+Read RFID
+Read DHT11
+Read BMP180
+Update SensorData
+Protect shared data with mutex
+```
+
+No network communication is performed inside the sensor functions.
+
+---
+
+# 3. Core 1 — Network Task
+
+Core 1 runs:
+
+```cpp
+networkTask()
+```
+
+The current version does not communicate with a server.
+
+Instead, Core 1:
+
+1. Reads the latest sensor data.
+2. Copies the data safely using the mutex.
+3. Prints the data to Serial.
+
+```text
+Core 0
+Sensor Task
+     │
+     │ SensorData
+     ↓
+Shared Data
+     │
+     │ mutex
+     ↓
+Core 1
+Network Task
+     │
+     ↓
+Serial Monitor
+```
+
+MQTT can be added to Core 1 later without changing the sensor functions.
+
+---
+
+# 4. Shared Sensor Data
+
+The ESP32 uses:
+
+```cpp
+struct SensorData
+```
+
+The structure currently contains:
+
+```text
+RFID UID
+Card Type
+DHT Temperature
+Humidity
+BMP Temperature
+Pressure
+```
+
+Example:
+
+```text
+RFID UID       → A3:7B:91:2F
+Card Type      → MIFARE 1KB
+DHT Temperature→ 5.4 °C
+Humidity       → 62.0 %
+BMP Temperature→ 5.8 °C
+Pressure       → 101325 Pa
+```
+
+Core 0 writes the sensor data.
+
+Core 1 reads a copy of the latest data.
+
+A mutex called:
+
+```cpp
+dataMutex
+```
+
+protects the shared data.
+
+---
+
+# 5. Hardware
+
+## Main Controller
+
+```text
+ESP32
+```
+
+The ESP32 provides:
+
+- GPIO
+- SPI
+- I2C
+- FreeRTOS
+- Dual-core processing
+
+---
+
+# 6. MFRC522 RFID Reader
+
+The RFID reader communicates with the ESP32 using SPI.
+
+### Pin Connections
+
+| MFRC522 | ESP32 |
+|---|---:|
+| SDA / SS | GPIO 5 |
+| RST | GPIO 27 |
+| SCK | GPIO 18 |
+| MISO | GPIO 19 |
+| MOSI | GPIO 23 |
+| 3.3V | 3.3V |
+| GND | GND |
+| IRQ | Not connected |
+
+### Voltage
+
+```text
+VCC: 3.3V
+Logic: 3.3V
+```
+
+The MFRC522 is connected to the ESP32's 3.3V supply.
+
+### RFID Data
+
+When a tag is detected, the ESP32 reads:
+
+```text
+UID
+Card Type
+```
+
+Example:
+
+```text
+RFID UID: A3:7B:91:2F
+Card Type: MIFARE 1KB
+```
+
+---
+
+# 7. DHT11
+
+The DHT11 provides:
+
+```text
+Temperature
+Humidity
+```
+
+### Pin Connections
+
+| DHT11 | ESP32 |
+|---|---:|
+| DATA | GPIO 26 |
+| VCC | 3.3V |
+| GND | GND |
+
+### Voltage
+
+```text
+VCC: 3.3V
+```
+
+### DHT11 Data
+
+Example:
+
+```text
+Temperature: 5.4 °C
+Humidity: 62.0 %
+```
+
+The DHT11 temperature is currently the main temperature value used in the shared sensor data.
+
+---
+
+# 8. BMP180
+
+The BMP180 communicates with the ESP32 using I2C.
+
+### Pin Connections
+
+| BMP180 | ESP32 |
+|---|---:|
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
+| VCC | 3.3V |
+| GND | GND |
+
+### Voltage
+
+```text
+VCC: 3.3V
+```
+
+### BMP180 Data
+
+The BMP180 provides:
+
+```text
+Temperature
+Pressure
+```
+
+Example:
+
+```text
+BMP Temperature: 5.8 °C
+Pressure: 101325 Pa
+```
+
+Pressure can also be displayed as:
+
+```text
+1013.25 hPa
+```
+
+---
+
+# 9. Complete Pin Table
+
+| Component | Pin | ESP32 |
+|---|---|---:|
+| MFRC522 | SDA / SS | GPIO 5 |
+| MFRC522 | RST | GPIO 27 |
+| MFRC522 | SCK | GPIO 18 |
+| MFRC522 | MISO | GPIO 19 |
+| MFRC522 | MOSI | GPIO 23 |
+| MFRC522 | VCC | 3.3V |
+| MFRC522 | GND | GND |
+| DHT11 | DATA | GPIO 26 |
+| DHT11 | VCC | 3.3V |
+| DHT11 | GND | GND |
+| BMP180 | SDA | GPIO 21 |
+| BMP180 | SCL | GPIO 22 |
+| BMP180 | VCC | 3.3V |
+| BMP180 | GND | GND |
+
+---
+
+# 10. Communication Interfaces
+
+The project currently uses two hardware communication interfaces.
+
+## SPI
+
+Used by:
+
+```text
+MFRC522
+```
+
+ESP32 SPI pins:
+
+```text
+SCK  → GPIO 18
+MISO → GPIO 19
+MOSI → GPIO 23
+SS   → GPIO 5
+```
+
+RFID reset:
+
+```text
+RST → GPIO 27
+```
+
+## I2C
+
+Used by:
+
+```text
+BMP180
+```
+
+ESP32 I2C pins:
+
+```text
+SDA → GPIO 21
+SCL → GPIO 22
+```
+
+---
+
+# 11. Sensor Data Flow
+
+The complete current data flow is:
+
+```text
+                 ESP32
+                   │
+          ┌────────┴────────┐
+          │                 │
+       Core 0            Core 1
+          │                 │
+    Sensor Task        Network Task
+          │                 │
+     ┌────┼────┐            │
+     │    │    │            │
+   RFID DHT  BMP            │
+     │    │    │            │
+     └────┼────┘            │
+          │                 │
+          ↓                 │
+     SensorData ────────────┘
+                            │
+                            ↓
+                       Serial Monitor
+```
+
+---
+
+# 12. Current Serial Output
+
+The current ESP32 does not send backend JSON.
+
+The current Core 1 output looks like:
+
+```text
+NETWORK TASK
+Core: 1
+RFID: A3:7B:91:2F
+Temperature: 5.4
+Humidity: 62.0
+BMP Temperature: 5.8
+Pressure: 101325
+```
+
+This means Core 1 is successfully receiving the latest sensor information from Core 0.
+
+---
+
+# 13. Current ESP32 Data
+
+The current firmware produces the following sensor information:
+
+| Data | Source | Current Status |
+|---|---|---|
+| RFID UID | MFRC522 | Available |
+| Card Type | MFRC522 | Available |
+| Temperature | DHT11 | Available |
+| Humidity | DHT11 | Available |
+| BMP Temperature | BMP180 | Available |
+| Pressure | BMP180 | Available |
+
+Example complete data:
+
+```text
+RFID UID: A3:7B:91:2F
+Card Type: MIFARE 1KB
+
+DHT11:
+Temperature: 5.4 °C
+Humidity: 62.0 %
+
+BMP180:
+Temperature: 5.8 °C
+Pressure: 101325 Pa
+```
+
+---
+
+# 14. Core Responsibilities
+
+## Core 0
+
+```text
+Core 0
+│
+└── Sensor Task
+    │
+    ├── readRFID()
+    ├── readDHT()
+    ├── readBMP()
+    │
+    └── Update SensorData
+```
+
+Core 0 is responsible only for sensor acquisition.
+
+## Core 1
+
+```text
+Core 1
+│
+└── Network Task
+    │
+    ├── Read SensorData
+    └── Print data to Serial
+```
+
+Core 1 is responsible for processing the shared data and will later handle network communication.
+
+---
+
+# 15. Important Separation Rule
+
+Keep the sensor and network responsibilities separate.
+
+Do not put network communication inside:
+
+```cpp
+readRFID()
+readDHT()
+readBMP()
+```
+
+The sensor functions should only read sensors and update the sensor data.
+
+The network task should handle communication later.
+
+Correct architecture:
+
+```text
+Core 0
+│
+├── RFID
+├── DHT11
+├── BMP180
+│
+└── SensorData
+       │
+       ↓
+     Mutex
+       │
+       ↓
+Core 1
+│
+└── Network Task
+```
+
+---
+
+# 16. Current Status
+
+### Implemented
+
+```text
+✓ ESP32
+✓ FreeRTOS
+✓ Core 0 Sensor Task
+✓ Core 1 Network Task
+✓ MFRC522 RFID
+✓ DHT11
+✓ BMP180
+✓ SPI
+✓ I2C
+✓ Shared SensorData
+✓ Mutex protection
+✓ Serial output
+```
+
+### Not Implemented
+
+```text
+✗ Wi-Fi
+✗ MQTT
+✗ HTTP
+✗ HTTPS
+✗ JSON transmission
+✗ Battery measurement
+✗ Local Flash buffering
+✗ Backend communication
+```
+
+---
+
+# 17. Current Firmware Architecture
+
+```text
+                         ESP32
+                           │
+            ┌──────────────┴──────────────┐
+            │                             │
+         CORE 0                        CORE 1
+            │                             │
+      Sensor Task                    Network Task
+            │                             │
+     ┌──────┼──────┐                      │
+     │      │      │                      │
+   RFID   DHT11  BMP180                    │
+     │      │      │                      │
+     └──────┼──────┘                      │
+            │                             │
+            ↓                             │
+       SensorData                          │
+            │                             │
+            └────────── Mutex ────────────┘
+                                          │
+                                          ↓
+                                    Serial Output
+```
+
+The current goal is to keep the ESP32 sensor system stable and clearly separated between Core 0 and Core 1 before adding network communication.# ESP32 Cold Chain Firmware
+
+## 1. Project Overview
+
+This firmware uses an ESP32 with three sensor modules:
+
+- MFRC522 RFID reader
+- DHT11 temperature and humidity sensor
+- BMP180 temperature and pressure sensor
+
+The ESP32 uses FreeRTOS to separate the work between its two CPU cores.
+
+```text
+ESP32
+│
+├── Core 0
+│   └── Sensor Task
+│       ├── RFID
+│       ├── DHT11
+│       └── BMP180
+│
+└── Core 1
+    └── Network Task
+        └── Reads SensorData
+            └── Prints data to Serial
+```
+
+The current firmware does **not** implement MQTT, HTTP, Wi-Fi, or backend communication.
+
+---
+
+# 2. FreeRTOS Architecture
+
+## Core 0 — Sensor Task
+
+Core 0 is responsible for reading all sensors.
+
+The main task is:
+
+```cpp
+sensorTask()
+```
+
+It runs on:
+
+```text
+Core 0
+```
+
+The sensor task calls:
+
+```cpp
+readSensors()
+```
+
+which handles:
+
+```cpp
+readRFID()
+readDHT()
+readBMP()
+```
+
+The sensor task updates the shared:
+
+```cpp
+SensorData
+```
+
+structure.
+
+### Core 0 responsibilities
+
+```text
+Read RFID
+Read DHT11
+Read BMP180
+Update SensorData
+Protect shared data with mutex
+```
+
+No network communication is performed inside the sensor functions.
+
+---
+
+# 3. Core 1 — Network Task
+
+Core 1 runs:
+
+```cpp
+networkTask()
+```
+
+The current version does not communicate with a server.
+
+Instead, Core 1:
+
+1. Reads the latest sensor data.
+2. Copies the data safely using the mutex.
+3. Prints the data to Serial.
+
+```text
+Core 0
+Sensor Task
+     │
+     │ SensorData
+     ↓
+Shared Data
+     │
+     │ mutex
+     ↓
+Core 1
+Network Task
+     │
+     ↓
+Serial Monitor
+```
+
+MQTT can be added to Core 1 later without changing the sensor functions.
+
+---
+
+# 4. Shared Sensor Data
+
+The ESP32 uses:
+
+```cpp
+struct SensorData
+```
+
+The structure currently contains:
+
+```text
+RFID UID
+Card Type
+DHT Temperature
+Humidity
+BMP Temperature
+Pressure
+```
+
+Example:
+
+```text
+RFID UID       → A3:7B:91:2F
+Card Type      → MIFARE 1KB
+DHT Temperature→ 5.4 °C
+Humidity       → 62.0 %
+BMP Temperature→ 5.8 °C
+Pressure       → 101325 Pa
+```
+
+Core 0 writes the sensor data.
+
+Core 1 reads a copy of the latest data.
+
+A mutex called:
+
+```cpp
+dataMutex
+```
+
+protects the shared data.
+
+---
+
+# 5. Hardware
+
+## Main Controller
+
+```text
+ESP32
+```
+
+The ESP32 provides:
+
+- GPIO
+- SPI
+- I2C
+- FreeRTOS
+- Dual-core processing
+
+---
+
+# 6. MFRC522 RFID Reader
+
+The RFID reader communicates with the ESP32 using SPI.
+
+### Pin Connections
+
+| MFRC522 | ESP32 |
+|---|---:|
+| SDA / SS | GPIO 5 |
+| RST | GPIO 27 |
+| SCK | GPIO 18 |
+| MISO | GPIO 19 |
+| MOSI | GPIO 23 |
+| 3.3V | 3.3V |
+| GND | GND |
+| IRQ | Not connected |
+
+### Voltage
+
+```text
+VCC: 3.3V
+Logic: 3.3V
+```
+
+The MFRC522 is connected to the ESP32's 3.3V supply.
+
+### RFID Data
+
+When a tag is detected, the ESP32 reads:
+
+```text
+UID
+Card Type
+```
+
+Example:
+
+```text
+RFID UID: A3:7B:91:2F
+Card Type: MIFARE 1KB
+```
+
+---
+
+# 7. DHT11
+
+The DHT11 provides:
+
+```text
+Temperature
+Humidity
+```
+
+### Pin Connections
+
+| DHT11 | ESP32 |
+|---|---:|
+| DATA | GPIO 26 |
+| VCC | 3.3V |
+| GND | GND |
+
+### Voltage
+
+```text
+VCC: 3.3V
+```
+
+### DHT11 Data
+
+Example:
+
+```text
+Temperature: 5.4 °C
+Humidity: 62.0 %
+```
+
+The DHT11 temperature is currently the main temperature value used in the shared sensor data.
+
+---
+
+# 8. BMP180
+
+The BMP180 communicates with the ESP32 using I2C.
+
+### Pin Connections
+
+| BMP180 | ESP32 |
+|---|---:|
+| SDA | GPIO 21 |
+| SCL | GPIO 22 |
+| VCC | 3.3V |
+| GND | GND |
+
+### Voltage
+
+```text
+VCC: 3.3V
+```
+
+### BMP180 Data
+
+The BMP180 provides:
+
+```text
+Temperature
+Pressure
+```
+
+Example:
+
+```text
+BMP Temperature: 5.8 °C
+Pressure: 101325 Pa
+```
+
+Pressure can also be displayed as:
+
+```text
+1013.25 hPa
+```
+
+---
+
+# 9. Complete Pin Table
+
+| Component | Pin | ESP32 |
+|---|---|---:|
+| MFRC522 | SDA / SS | GPIO 5 |
+| MFRC522 | RST | GPIO 27 |
+| MFRC522 | SCK | GPIO 18 |
+| MFRC522 | MISO | GPIO 19 |
+| MFRC522 | MOSI | GPIO 23 |
+| MFRC522 | VCC | 3.3V |
+| MFRC522 | GND | GND |
+| DHT11 | DATA | GPIO 26 |
+| DHT11 | VCC | 3.3V |
+| DHT11 | GND | GND |
+| BMP180 | SDA | GPIO 21 |
+| BMP180 | SCL | GPIO 22 |
+| BMP180 | VCC | 3.3V |
+| BMP180 | GND | GND |
+
+---
+
+# 10. Communication Interfaces
+
+The project currently uses two hardware communication interfaces.
+
+## SPI
+
+Used by:
+
+```text
+MFRC522
+```
+
+ESP32 SPI pins:
+
+```text
+SCK  → GPIO 18
+MISO → GPIO 19
+MOSI → GPIO 23
+SS   → GPIO 5
+```
+
+RFID reset:
+
+```text
+RST → GPIO 27
+```
+
+## I2C
+
+Used by:
+
+```text
+BMP180
+```
+
+ESP32 I2C pins:
+
+```text
+SDA → GPIO 21
+SCL → GPIO 22
+```
+
+---
+
+# 11. Sensor Data Flow
+
+The complete current data flow is:
+
+```text
+                 ESP32
+                   │
+          ┌────────┴────────┐
+          │                 │
+       Core 0            Core 1
+          │                 │
+    Sensor Task        Network Task
+          │                 │
+     ┌────┼────┐            │
+     │    │    │            │
+   RFID DHT  BMP            │
+     │    │    │            │
+     └────┼────┘            │
+          │                 │
+          ↓                 │
+     SensorData ────────────┘
+                            │
+                            ↓
+                       Serial Monitor
+```
+
+---
+
+# 12. Current Serial Output
+
+The current ESP32 does not send backend JSON.
+
+The current Core 1 output looks like:
+
+```text
+NETWORK TASK
+Core: 1
+RFID: A3:7B:91:2F
+Temperature: 5.4
+Humidity: 62.0
+BMP Temperature: 5.8
+Pressure: 101325
+```
+
+This means Core 1 is successfully receiving the latest sensor information from Core 0.
+
+---
+
+# 13. Current ESP32 Data
+
+The current firmware produces the following sensor information:
+
+| Data | Source | Current Status |
+|---|---|---|
+| RFID UID | MFRC522 | Available |
+| Card Type | MFRC522 | Available |
+| Temperature | DHT11 | Available |
+| Humidity | DHT11 | Available |
+| BMP Temperature | BMP180 | Available |
+| Pressure | BMP180 | Available |
+
+Example complete data:
+
+```text
+RFID UID: A3:7B:91:2F
+Card Type: MIFARE 1KB
+
+DHT11:
+Temperature: 5.4 °C
+Humidity: 62.0 %
+
+BMP180:
+Temperature: 5.8 °C
+Pressure: 101325 Pa
+```
+
+---
+
+# 14. Core Responsibilities
+
+## Core 0
+
+```text
+Core 0
+│
+└── Sensor Task
+    │
+    ├── readRFID()
+    ├── readDHT()
+    ├── readBMP()
+    │
+    └── Update SensorData
+```
+
+Core 0 is responsible only for sensor acquisition.
+
+## Core 1
+
+```text
+Core 1
+│
+└── Network Task
+    │
+    ├── Read SensorData
+    └── Print data to Serial
+```
+
+Core 1 is responsible for processing the shared data and will later handle network communication.
+
+---
+
+# 15. Important Separation Rule
+
+Keep the sensor and network responsibilities separate.
+
+Do not put network communication inside:
+
+```cpp
+readRFID()
+readDHT()
+readBMP()
+```
+
+The sensor functions should only read sensors and update the sensor data.
+
+The network task should handle communication later.
+
+Correct architecture:
+
+```text
+Core 0
+│
+├── RFID
+├── DHT11
+├── BMP180
+│
+└── SensorData
+       │
+       ↓
+     Mutex
+       │
+       ↓
+Core 1
+│
+└── Network Task
+```
+
+---
+
+# 16. Current Status
+
+### Implemented
+
+```text
+✓ ESP32
+✓ FreeRTOS
+✓ Core 0 Sensor Task
+✓ Core 1 Network Task
+✓ MFRC522 RFID
+✓ DHT11
+✓ BMP180
+✓ SPI
+✓ I2C
+✓ Shared SensorData
+✓ Mutex protection
+✓ Serial output
+```
+
+### Not Implemented
+
+```text
+✗ Wi-Fi
+✗ MQTT
+✗ HTTP
+✗ HTTPS
+✗ JSON transmission
+✗ Battery measurement
+✗ Local Flash buffering
+✗ Backend communication
+```
+
+---
+
+# 17. Current Firmware Architecture
+
+```text
+                         ESP32
+                           │
+            ┌──────────────┴──────────────┐
+            │                             │
+         CORE 0                        CORE 1
+            │                             │
+      Sensor Task                    Network Task
+            │                             │
+     ┌──────┼──────┐                      │
+     │      │      │                      │
+   RFID   DHT11  BMP180                    │
+     │      │      │                      │
+     └──────┼──────┘                      │
+            │                             │
+            ↓                             │
+       SensorData                          │
+            │                             │
+            └────────── Mutex ────────────┘
+                                          │
+                                          ↓
+                                    Serial Output
+```
+
+The current goal is to keep the ESP32 sensor system stable and clearly separated between Core 0 and Core 1 before adding network communication.
